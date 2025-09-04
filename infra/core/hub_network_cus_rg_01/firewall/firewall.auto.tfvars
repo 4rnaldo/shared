@@ -1,0 +1,21 @@
+firewall_name        = "hub-eus-afw-01"
+resource_group_name  = "hub-network-eus-rg-01"
+virtual_network_name = "hub-eus-vnet-01"
+location             = "EastUS"
+sku_tier             = "Premium"
+sku                  = "AZFW_VNet"
+subnet_name          = "AzureFirewallSubnet"
+fw_policy_name       = "policy-hub-eus-afw-01"
+
+tags = { # TODO - UPDATE
+  Owner           = "Avaneesh Arora"
+  Environment     = "Prod"
+  CreatedBy       = "Terraform"
+  Location        = "EastUS"
+  CostCenter      = "Main"
+  Criticality     = "High"
+  ApplicationName = "Shared"
+  CreatedDate     = "10-03-2024"
+  TFManaged       = "True"
+  OpsTeam         = "IT"
+}

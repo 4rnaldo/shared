@@ -1,0 +1,149 @@
+stages:
+  - container_setup
+  - terraform_plan
+  - terraform_apply
+
+workflow:
+  rules:
+    #- if: '$CI_PIPELINE_SOURCE == "merge_request_event"'  # Only trigger on merge requests
+    - if: '$CI_PIPELINE_SOURCE == "web"' # Allow on demand triggers for Gitlab UI
+    - when: never # Disable automatic pipeline execution on push event
+
+variables:
+  TERRAFORM_MODULES:
+    description: "Please provide a value for Terraform Modules. Append modules in newline (ex. resource_group)"
+  GATIK_ENV:
+    description: "Please provide a value for the Environment Directory you wish to execute the Terraform Modules (ex. hub_network_eus_rg_01)"
+  ARM_CLIENT_ID: $AZURE_CLIENT_ID
+  ARM_CLIENT_SECRET: $AZURE_CLIENT_SECRET
+  ARM_TENANT_ID: $AZURE_TENANT_ID
+  ARM_SUBSCRIPTION_ID: $AZURE_SUBSCRIPTION_ID
+  TF_ROOT: "$TF_ROOT/$GATIK_ENV"
+  # Additional variables referenced from Gitlab CI/CD Variables:
+  # AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_STORAGE_ACCOUNT, AZURE_SUBSCRIPTION_ID, 
+  # AZURE_TENANT_ID, GATIK_ENV, SSH_PRIVATE_KEY, STORAGE_ACCOUNT_RG, TERRAFORM_CONTAINER, TERRAFORM_VERSION, TF_ROOT
+
+# Create terraform container
+azure_container:
+  stage: container_setup
+  image: mcr.microsoft.com/azure-cli:cbl-mariner2.0
+  before_script:
+    - tdnf makecache
+    - tdnf install -y jq
+  script:
+    # Login to Azure
+    - echo "Logging into Azure..."
+    - az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID"
+    - echo "Creating storage container..."
+    # Create container if it does not exist, skip if it exists already
+    - |
+      CONTAINER_EXISTS=$(az storage container list \
+          --account-name $AZURE_STORAGE_ACCOUNT \
+          --auth-mode login \
+          --query "[?name=='$TERRAFORM_CONTAINER'] | length(@)" --output tsv)
+
+      if [ "$CONTAINER_EXISTS" -eq 0 ]; then
+          echo "Container does not exist. Creating container..."
+          az storage container create \
+              --name $TERRAFORM_CONTAINER \
+              --account-name $AZURE_STORAGE_ACCOUNT \
+              --auth-mode login
+          echo "Container created successfully."
+      else
+          echo "Container already exists. Skipping creation."
+      fi
+
+# Execute terraform plan
+terraform_plan:
+  stage: terraform_plan
+  image: 
+    name: hashicorp/terraform:${TERRAFORM_VERSION}
+    entrypoint: [""]
+  variables:
+    GIT_SSH_COMMAND: 'ssh -o StrictHostKeyChecking=no'
+  before_script:
+    # Create the .ssh directory and inject the SSH private key
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    # Add GitLab to known hosts (or you can disable key checking entirely)
+    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
+    # Test SSH connection (optional for debugging)
+    - ssh -T git@gitlab.com || true
+  script:
+    - mkdir -p ${CI_PROJECT_DIR}/plans
+    - |
+      # Handle multi-line TERRAFORM_MODULES variable
+      echo "Terraform modules to run:"
+      echo "${TERRAFORM_MODULES}"
+      echo "Environment directory for terraform module execution: ${GATIK_ENV}"
+      # Convert new lines to spaces
+      modules=$(echo "${TERRAFORM_MODULES}" | tr '\n' ' ')
+      
+      # Replace '/' with '-' in branch name for safe file naming
+      gitlab_branch_name=$(echo "${CI_COMMIT_REF_NAME}" | sed 's/\//-/g')
+
+      # Run terraform plan for each module
+      for module in $modules; do
+        echo "Running terraform plan for module: ${module}";
+        cd ${TF_ROOT}/${module};
+        
+        terraform init -input=false \
+        -backend-config="resource_group_name=$STORAGE_ACCOUNT_RG" \
+        -backend-config="storage_account_name=$AZURE_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TERRAFORM_CONTAINER" \
+        -backend-config="key=${GATIK_ENV}_${module}.tfstate";
+        
+        terraform plan -input=false -out=${CI_PROJECT_DIR}/plans/${module}.tfplan;
+        
+        cd -;  # Go back to the root directory
+      done
+  artifacts:
+    paths:
+      - ${CI_PROJECT_DIR}/plans/*.tfplan
+    when: always
+
+# Execute terraform apply, trigger is manually done
+terraform_apply:
+  stage: terraform_apply
+  image: 
+    name: hashicorp/terraform:${TERRAFORM_VERSION}
+    entrypoint: [""]
+  dependencies:
+    - terraform_plan
+  variables:
+    GIT_SSH_COMMAND: 'ssh -o StrictHostKeyChecking=no'
+  before_script:
+    # Create the .ssh directory and inject the SSH private key
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    # Add GitLab to known hosts (or you can disable key checking entirely)
+    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
+    # Test SSH connection (optional for debugging)
+    - ssh -T git@gitlab.com || true
+  script:
+    - |
+      # Handle multi-line TERRAFORM_MODULES variable
+      echo "Modules to apply: ${TERRAFORM_MODULES}"
+      modules=$(echo "${TERRAFORM_MODULES}" | tr '\n' ' ')  # Convert new lines to spaces
+      
+      # Replace '/' with '-' in branch name for safe file naming
+      gitlab_branch_name=$(echo "${CI_COMMIT_REF_NAME}" | sed 's/\//-/g')
+
+      # Run terraform apply for each module
+      for module in $modules; do
+        echo "Running terraform apply for module: ${module}";
+        cd ${TF_ROOT}/${module};
+        
+        terraform init -input=false \
+        -backend-config="resource_group_name=$STORAGE_ACCOUNT_RG" \
+        -backend-config="storage_account_name=$AZURE_STORAGE_ACCOUNT" \
+        -backend-config="container_name=$TERRAFORM_CONTAINER" \
+        -backend-config="key=${GATIK_ENV}_${module}.tfstate";
+        
+        terraform apply -input=false -auto-approve ${CI_PROJECT_DIR}/plans/${module}.tfplan;
+        
+        cd -;  # Go back to the root directory
+      done
+  when: manual
